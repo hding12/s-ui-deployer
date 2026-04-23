@@ -1,0 +1,8 @@
+[project]
+name = "sui-deployer"
+version = "0.1.0"
+description = "S-UI deployment automation for existing VPS/EC2 instances"
+requires-python = ">=3.11"
+
+[project.scripts]
+sui-deploy = "sui_deployer.cli:main"
