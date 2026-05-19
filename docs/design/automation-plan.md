@@ -2,6 +2,14 @@
 
 本文档规划如何把 S-UI 搭建流程逐步自动化。当前已经落地 `source/` / `work/` 目录边界、CLI 骨架、只读诊断、安装、证书、HTTPS 配置、API token 创建、API 导出、`plan-apply` 和 `apply` 的首版闭环。
 
+证书自动更新的控制方案单独见：
+
+- [certificate-renewal-control-loop.md](certificate-renewal-control-loop.md)
+
+链路级 CLI 扩展的过渡路线图见：
+
+- [chain-cli-extension-roadmap.md](chain-cli-extension-roadmap.md)
+
 ## 设计原则
 
 - 先做只读诊断，再做半自动部署。
@@ -39,7 +47,8 @@ bin/sui-deploy render-checklist <workdir>/sites/<site-id>/site.env
 - `ROOT_PASSWORD` 不为空，或 `ROOT_PASSWORD_SOURCE` 指向可解析的密码管理器引用。
 - `WEB_PATH`、`SUB_PATH` 是长随机路径。
 - 入站端口合法，且 TCP/UDP 协议标注清晰。
-- 出站代理字段非空。
+- `OUTBOUND_MODE=direct` 时允许代理字段为空。
+- `OUTBOUND_MODE=socks` 时要求代理服务器和端口非空。
 
 ## Phase 2：SSH 只读诊断
 
@@ -119,6 +128,13 @@ SSL 证书自动化规则：
 - 证书生成后验证 `/root/cert/<domain>/fullchain.pem` 和 `/root/cert/<domain>/privkey.pem` 存在。
 - 不把 `/root/.acme.sh/<domain>_ecc/<domain>.cer` 和 `<domain>.key` 写入 S-UI 面板配置。它们是 acme.sh 签发/续签工作目录；S-UI 脚本会通过 `acme.sh --installcert` 安装到 `/root/cert/<domain>/fullchain.pem` 和 `privkey.pem`，这才是面板、订阅和 TLS 模板的标准使用路径。
 - 只保存证书路径，不保存私钥内容。
+
+证书自动更新原则：
+
+- 不把“90 天证书、30 天前续签”写死在代码里。
+- 阈值按证书实际寿命动态计算，兼容未来更短生命周期证书。
+- 续签必须验证“外部 TLS 握手已经切到新证书”，不能只信 acme.sh 输出。
+- 推荐用远端 `systemd timer` 做内环自动续签，本地 `S-UI Deployer` 做外环监督。
 
 ## Phase 4：备份、恢复与脱敏摘要
 
@@ -221,6 +237,48 @@ bin/sui-deploy plan-apply <workdir>/sites/<site-id>/site.env
 bin/sui-deploy apply <workdir>/sites/<site-id>/site.env
 ```
 
+## Phase 6：证书自动更新闭环
+
+目标：让每个站点具备自治续签、自动校验和失败回退能力。
+
+建议新增命令：
+
+```bash
+bin/sui-deploy cert-status <workdir>/sites/<site-id>/site.env
+bin/sui-deploy cert-renew <workdir>/sites/<site-id>/site.env
+bin/sui-deploy cert-supervise <workdir>/sites/<site-id>/site.env
+bin/sui-deploy install-cert-supervisor <workdir>/sites/<site-id>/site.env
+```
+
+核心策略：
+
+1. 用远端 `systemd timer` 作为高频内环。
+2. 用 `cert-supervise` 做状态机判断。
+3. 用 `cert-renew` 做一次性续签、安装、重启和验证。
+4. 用 `cert-status` 和后续的多站点汇总命令做外环监督。
+
+实施边界：
+
+- 主控制器放在远端 VPS，本地工具只做安装、触发和监督。
+- 远端固定产出状态文件和日志文件，不把运行态写回 `site.env`。
+- 成功判据不是 `acme.sh` 输出，而是“文件证书、服务状态、外部 TLS 握手”三者一致。
+- 失败进入 `degraded`、`urgent` 或 `manual_intervention`，不能静默通过。
+
+建议实施顺序：
+
+1. `cert-status`
+   - 先把观测做准，不修改远端。
+2. `cert-renew --dry-run`
+   - 验证 acme.sh、证书路径、备份和日志路径。
+3. `cert-renew`
+   - 跑通一次人工触发续签闭环。
+4. `install-cert-supervisor`
+   - 安装远端 `service + timer + supervisor`。
+5. `cert-supervise`
+   - 补外环监督和退出码分级。
+
+详细设计与命令契约见 [certificate-renewal-control-loop.md](certificate-renewal-control-loop.md)。
+
 `plan-apply` 当前行为：
 
 - 读取 `/apiv2/load`。
@@ -270,7 +328,56 @@ bin/sui-deploy rollback <workdir>/sites/<site-id>/site.env <workdir>/backups/las
 
 更多细节见 [api-automation-evaluation.md](api-automation-evaluation.md)。
 
-## Phase 6：多 EC2 外部编排
+## Phase 7：链路级 CLI 扩展（已实现的过渡方案）
+
+目标：在不做全局重构的前提下，先交付单站点内“完整链路”的最小 CRUD 能力。当前这一阶段已经落地首版实现。
+
+当前阶段的明确决策：
+
+- 先使用新增 CLI 扩展方案。
+- 暂不重写现有站点级 `apply` 闭环。
+- 结构性问题记入延期重构 TODO，不在本阶段一次性解决。
+
+已实现命令：
+
+```bash
+bin/sui-deploy chain-import-current <workdir>/sites/<site-id>/site.env
+bin/sui-deploy chain-list <workdir>/sites/<site-id>/site.env
+bin/sui-deploy chain-show <workdir>/sites/<site-id>/site.env <chain-id>
+bin/sui-deploy chain-plan-create <workdir>/sites/<site-id>/site.env <chain.json>
+bin/sui-deploy chain-apply-create <workdir>/sites/<site-id>/site.env <chain.json>
+bin/sui-deploy chain-plan-delete <workdir>/sites/<site-id>/site.env <chain-id>
+bin/sui-deploy chain-apply-delete <workdir>/sites/<site-id>/site.env <chain-id>
+```
+
+当前阶段的链路定义：
+
+```text
+一个用户 + 一个入站 + 一个出站策略 + 一条路由绑定
+```
+
+支持的出站模式：
+
+- `direct`
+- `shared`
+- `dedicated`
+
+当前实现要点：
+
+- `chain-import-current` 优先按 route rule 导入当前主链路；命中 route rule 时默认记为 `shared`，不自动推断 dedicated ownership。
+- `chain-plan-create` 和 `chain-apply-create` 在前置校验阶段会把以下情况视为致命错误并直接返回非零退出码：
+  - 端口被其他 tag 占用
+  - TLS 模板不存在
+  - `shared` 引用的出站不存在
+- `chain-apply-create` 仅在前置校验通过后才执行备份和远端写入。
+- `chain-apply-delete` 会先清理 route rule，再裁剪客户端 `inbounds`，最后按 ownership 检查决定是否删除 dedicated 出站。
+- 当前链路级验证是结构验证，不自动做真实出口 IP 和协议级连通性验证。
+
+当前阶段不立即处理的大重构问题见：
+
+- [chain-cli-extension-roadmap.md](chain-cli-extension-roadmap.md)
+
+## Phase 8：多 EC2 外部编排
 
 目标：在多台 AWS EC2 上分别运行独立 S-UI 实例，由 `s-ui-deployer` 统一读取 inventory 并批量调用 SSH 和 `/apiv2`。
 

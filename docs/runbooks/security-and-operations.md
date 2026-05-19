@@ -116,6 +116,7 @@ PasswordAuthentication yes
 - 新增或删除客户端前。
 - 轮换住宅代理凭据前。
 - 升级 S-UI 前。
+- 第一次安装 cert-supervisor 前（Timer 安装本身不危险，但验证过程依赖当前证书状态）。
 
 备份命令：
 
@@ -133,7 +134,76 @@ scp -i /path/to/key.pem ubuntu@VPS_HOST:/tmp/s-ui-backup-YYYYMMDD-HHMMSS.tar.gz 
 
 `work/backups/` 默认不提交仓库。
 
-## 7. 凭据轮换
+## 7. 证书自动续签运维
+
+证书自动续签采用 VPS 本机 systemd timer 内环 + 工作站监督外环的双层闭环。
+
+### 7.1 安装
+
+每个站点只需执行一次：
+
+```bash
+sui-deploy install-cert-supervisor <workdir>/sites/<site-id>/site.env
+```
+
+这会安装以下文件到 VPS：
+
+| 文件 | 路径 | 作用 |
+| --- | --- | --- |
+| supervisor 脚本 | `/usr/local/s-ui-deployer/cert-supervisor.sh` | 单次检查+续签闭环 |
+| supervisor 配置 | `/usr/local/s-ui-deployer/cert-supervisor.env` | 从 site.env 映射的环境变量 |
+| systemd service | `/etc/systemd/system/sui-cert-supervisor.service` | 调用 supervisor 脚本 |
+| systemd timer | `/etc/systemd/system/sui-cert-supervisor.timer` | 每 12 小时调度 |
+
+状态和日志：
+
+| 内容 | 路径 |
+| --- | --- |
+| 可机读状态 | `/var/lib/s-ui-deployer/cert-state.json` |
+| 运行日志 | `/var/log/s-ui-deployer/cert-supervisor.log` |
+
+### 7.2 日常巡检
+
+```bash
+# 检查证书状态（推荐每周）
+sui-deploy cert-status <workdir>/sites/<site-id>/site.env
+
+# 监督巡检（外环）
+sui-deploy cert-supervise <workdir>/sites/<site-id>/site.env
+```
+
+`cert-supervise` 的退出码表示状态等级：
+
+- 0：正常
+- 2：降级（续签失败，但证书未到期）
+- 3：紧急（剩余天数极少）
+- 4：需人工介入（已过期或连续失败达上限）
+
+### 7.3 手动续签
+
+```bash
+# 只预览操作
+sui-deploy cert-renew <workdir>/sites/<site-id>/site.env --dry-run
+
+# 实际执行
+sui-deploy cert-renew <workdir>/sites/<site-id>/site.env
+```
+
+### 7.4 异常处理
+
+如果自动续签反复失败：
+
+1. 检查 DNS 解析：`sui-deploy cert-status <site.env>` 的 DNS 一致性字段
+2. 检查 80 端口可达性：ACME HTTP challenge 需要 TCP 80 可达
+3. 检查服务器时间：`sudo timedatectl` 确认无大幅漂移
+4. 检查 S-UI 证书路径配置：`/root/cert/<domain>/fullchain.pem` 是否存在
+5. 手动执行一次续签观察完整输出：`sui-deploy cert-renew <site.env>`
+6. 如果连续失败超限进入 `manual_intervention`，检查远程日志：
+   ```bash
+   ssh -i <key> <user>@<host> "cat /var/log/s-ui-deployer/cert-supervisor.log"
+   ```
+
+## 9. 凭据轮换
 
 触发轮换的情况：
 
@@ -156,7 +226,7 @@ scp -i /path/to/key.pem ubuntu@VPS_HOST:/tmp/s-ui-backup-YYYYMMDD-HHMMSS.tar.gz 
 8. 重新导入客户端订阅并验证出口 IP。
 9. 记录轮换时间和原因，不记录明文密码。
 
-## 8. 泄露响应
+## 10. 泄露响应
 
 如果怀疑订阅或节点被泄露：
 
@@ -177,7 +247,7 @@ scp -i /path/to/key.pem ubuntu@VPS_HOST:/tmp/s-ui-backup-YYYYMMDD-HHMMSS.tar.gz 
 5. 检查系统新增用户和 crontab。
 6. 必要时从干净备份重建 VPS。
 
-## 9. 日志脱敏
+## 11. 日志脱敏
 
 以下命令可能输出域名、来源 IP、客户端标识和错误细节：
 
@@ -194,6 +264,6 @@ sudo ss -lntup
 - 用户真实 IP。
 - 业务访问域名，如果它属于隐私信息。
 
-## 10. 合规边界
+## 12. 合规边界
 
 本文档只用于搭建受控、自用或授权用户使用的网络连接服务。不要把节点提供给未知用户，不要用于违反云厂商、住宅代理服务商或目标网站规则的用途。

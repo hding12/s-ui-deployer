@@ -26,7 +26,7 @@ export SITE_ID="my-site"
 mkdir -p "$SUI_WORKDIR/sites/$SITE_ID"
 cp -R examples/site-workspace-template/. "$SUI_WORKDIR/sites/$SITE_ID/"
 mv "$SUI_WORKDIR/sites/$SITE_ID/site.env.example" "$SUI_WORKDIR/sites/$SITE_ID/site.env"
-mkdir -p "$SUI_WORKDIR/sites/$SITE_ID"/{logs,backups,generated,api-export}
+mkdir -p "$SUI_WORKDIR/sites/$SITE_ID"/{chains,logs,backups,generated,api-export}
 ```
 
 后续命令都使用：
@@ -250,3 +250,214 @@ https://<DOMAIN>:2095/<WEB_PATH>/
 - 确认 VLESS、TUIC、Hysteria2、Trojan 都存在。
 - 至少测试一个节点可连通。
 - 访问 IP 检测网站确认出口符合出站模式预期。
+
+## 16. 使用链路级 CLI
+
+站点初始化完成后，可以继续用链路级 CLI 增量管理单条链路。
+
+链路定义：
+
+```text
+一条链路 = 一个用户 + 一个入站 + 一个出站策略 + 一条路由绑定
+```
+
+出站策略说明：
+
+- `direct`：不创建额外出站，不写 route rule，流量走站点默认出口。
+- `shared`：复用现有出站，并按 inbound 写 route rule。
+- `dedicated`：创建专属出站，并按 inbound 写 route rule。
+
+### 16.1 导入当前主链路
+
+如果站点已经由 `apply` 初始化完成，可以先把当前主链路导入到本地：
+
+```bash
+bin/sui-deploy chain-import-current "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+bin/sui-deploy chain-list "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+```
+
+导入结果会保存到：
+
+```text
+$SUI_WORKDIR/sites/$SITE_ID/chains/<chain-id>.json
+```
+
+说明：
+
+- `chain-import-current` 会优先按 route rule 识别当前链路的出站。
+- 如果识别到 route rule，导入结果默认记为 `shared`，不会自动推断 dedicated ownership。
+- 如果确认某个出站是该链路独占的，再手工把 `mode` 改为 `dedicated`。
+
+### 16.2 新建一条链路
+
+在 `chains/` 下准备一个链路文件，例如：
+
+```json
+{
+  "chain_id": "alice-vless",
+  "name": "alice",
+  "client": {
+    "uuid": "",
+    "password": "",
+    "volume": 0,
+    "expiry": 0
+  },
+  "inbound": {
+    "type": "vless",
+    "tag": "vless-alice",
+    "listen_port": 11001,
+    "tls_tag": "reality",
+    "transport": {},
+    "addrs": []
+  },
+  "outbound": {
+    "mode": "shared",
+    "tag": "socks-residential"
+  }
+}
+```
+
+创建前先看计划：
+
+```bash
+bin/sui-deploy chain-plan-create "$SUI_WORKDIR/sites/$SITE_ID/site.env" \
+  "$SUI_WORKDIR/sites/$SITE_ID/chains/alice-vless.json"
+```
+
+当前会被直接阻断的前置错误：
+
+- 端口被其他 tag 占用
+- TLS 模板不存在
+- `shared` 模式引用的出站不存在
+
+通过后再执行：
+
+```bash
+bin/sui-deploy chain-apply-create "$SUI_WORKDIR/sites/$SITE_ID/site.env" \
+  "$SUI_WORKDIR/sites/$SITE_ID/chains/alice-vless.json"
+```
+
+执行顺序：
+
+1. 前置校验
+2. 远端备份
+3. 必要时创建 dedicated 出站
+4. 创建或编辑 inbound
+5. 创建或编辑 client
+6. 必要时写入 route rule
+7. 重启 core
+8. 回写生成的客户端凭据到本地链路文件
+9. 结构验证
+
+### 16.3 删除一条链路
+
+先看删除计划：
+
+```bash
+bin/sui-deploy chain-plan-delete "$SUI_WORKDIR/sites/$SITE_ID/site.env" alice-vless
+```
+
+再执行删除：
+
+```bash
+bin/sui-deploy chain-apply-delete "$SUI_WORKDIR/sites/$SITE_ID/site.env" alice-vless
+```
+
+删除行为：
+
+1. 先备份
+2. 删除当前 inbound 对应的 route rule
+3. 从 client 的 `inbounds` 列表中裁剪当前 inbound
+4. 当 client 不再绑定任何 inbound 时才删除 client
+5. 删除 inbound
+6. 仅当链路定义明确为 `dedicated`，且没有其他链路引用该出站时才删除 outbound
+7. 重启 core
+8. 删除本地链路文件
+9. 结构验证
+
+### 16.4 当前边界
+
+- 链路级 CLI 当前只实现 `import/list/show/plan-create/apply-create/plan-delete/apply-delete`。
+- 还没有 `chain-update`、`chain-reconcile`、`chain-verify`。
+- 当前验证偏向结构验证，不自动做真实出口 IP 或协议级连通性验证。
+
+## 17. 证书自动续签
+
+站点初始化并获取 SSL 证书后，可以使用证书自动续签功能自动管理证书生命周期。
+
+### 工作原理
+
+采用双层闭环架构：
+
+**内环（VPS 本机）** — systemd timer 每 12 小时执行一次：
+  1. 解析当前证书，计算剩余天数
+  2. 剩余 > 续签窗口 → 仅观测，不动作
+  3. 剩余 ≤ 续签窗口 → 备份旧证书 → `acme.sh --renew` → `--install-cert` → 重启 `s-ui.service` → 验证 TLS 指纹
+  4. 写状态文件到 `/var/lib/s-ui-deployer/cert-state.json`
+
+**外环（工作站）** — 可选定期巡检，读取远端状态，输出等级化结果。
+
+### 17.1 检查当前证书状态
+
+```bash
+bin/sui-deploy cert-status "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+```
+
+输出：有效期、剩余天数、状态等级、服务状态、DNS 一致性、TLS 指纹匹配情况。
+
+### 17.2 手动触发续签
+
+```bash
+# 先看计划（不修改远端）
+bin/sui-deploy cert-renew "$SUI_WORKDIR/sites/$SITE_ID/site.env" --dry-run
+
+# 实际执行
+bin/sui-deploy cert-renew "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+
+# 强制续签（即使证书未到续签窗口）
+bin/sui-deploy cert-renew "$SUI_WORKDIR/sites/$SITE_ID/site.env" --force
+```
+
+执行顺序：备份旧证书 → acme.sh 续签 → 安装到 `/root/cert/<domain>/` → 重启 s-ui.service → 验证文件指纹与对外 TLS 指纹一致。
+
+### 17.3 安装自动 supervisor（一次性）
+
+```bash
+bin/sui-deploy install-cert-supervisor "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+```
+
+该命令会：
+1. scp 上传 `cert-supervisor.sh`、`cert-supervisor.env`、systemd service/timer 到 VPS
+2. `daemon-reload` + `enable --now` 启动 timer
+3. 验证 timer 为 active
+4. **立即执行一次首次检查** — 运行 `sui-cert-supervisor.service`
+5. **验证状态文件已生成** — 确认 `/var/lib/s-ui-deployer/cert-state.json` 存在且非空
+
+上传错误、配置错误、权限问题、状态文件写入失败等都在安装时暴露，不等下一个 timer 周期。首次检查成功后，VPS 每 12 小时自动检查证书。Timer 配置 `Persistent=true`，关机重启后自动补跑。
+
+### 17.4 监督状态（外环巡检）
+
+```bash
+bin/sui-deploy cert-supervise "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+```
+
+返回退出码按状态等级区分：
+
+| 退出码 | 状态 | 含义 |
+| --- | --- | --- |
+| 0 | healthy / renew_due | 正常或待续签（无需人工） |
+| 2 | degraded | 续签失败但证书未到期 |
+| 3 | urgent | 剩余天数极少 |
+| 4 | manual_intervention | 证书已过期或连续失败达上限 |
+
+### 状态等级说明
+
+| 状态 | 条件 | 行为 |
+| --- | --- | --- |
+| healthy | 剩余 > 续签窗口 | 只观测 |
+| renew_due | 剩余 ≤ 续签窗口 | 自动续签 |
+| degraded | 续签失败，证书未到期 | 退避后重试 |
+| urgent | 剩余 ≤ 紧急窗口 | 提高重试频率 |
+| manual_intervention | 已过期或连续失败达上限 | 停止自动，等待人工 |
+
+详细设计见 [design/certificate-renewal-control-loop.md](design/certificate-renewal-control-loop.md)。

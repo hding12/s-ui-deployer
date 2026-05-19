@@ -2,7 +2,7 @@
 
 S-UI Deployer 是一个面向 VPS/EC2 的 S-UI 自动化部署工具。它把可提交的工具源码、模板和文档，与不可提交的站点配置、日志、备份和密钥材料分开管理，适合从单台机器开始，逐步扩展到多台站点。
 
-当前版本以 Ubuntu/Debian、S-UI v1.4.1、OpenSSH/scp 和 S-UI `/apiv2` 为主要目标。工具支持安装 S-UI、配置面板和订阅 HTTPS、创建 API token、导出配置、生成执行计划、应用 TLS/出站/入站/客户端配置，并在修改远端前自动备份。
+当前版本以 Ubuntu/Debian、S-UI v1.4.1、OpenSSH/scp 和 S-UI `/apiv2` 为主要目标。工具支持安装 S-UI、配置面板和订阅 HTTPS、创建 API token、导出配置、生成执行计划、应用 TLS/出站/入站/客户端配置，并在修改远端前自动备份。当前还支持单站点内的链路级 CLI：导入现有主链路、列出链路、查看链路、创建链路和删除链路。证书自动续签章节新增 4 个命令：`cert-status`、`cert-renew`、`cert-supervise`、`install-cert-supervisor`。采用双层闭环架构——VPS 本机 systemd timer 内环 + 工作站监督外环。
 
 ## 适用场景
 
@@ -10,6 +10,7 @@ S-UI Deployer 是一个面向 VPS/EC2 的 S-UI 自动化部署工具。它把可
 - 希望用同一套配置模板管理多个站点。
 - 希望用工具重复执行 `check -> diagnose -> bootstrap -> configure-panel -> issue-cert -> configure-https -> create-api-token -> api-export -> plan-apply -> apply`。
 - 出口既可以使用 VPS 默认直连出口，也可以使用住宅 SOCKS 上游出口。
+- 希望在单个站点内继续增量管理“用户 + 入站 + 出站策略 + 路由绑定”这类完整链路。
 
 暂不覆盖：
 
@@ -42,6 +43,7 @@ tests/                  # 本地单元测试和 fixture
   sites/
     <site-id>/
       site.env
+      chains/
       logs/
       backups/
       generated/
@@ -51,7 +53,7 @@ tests/                  # 本地单元测试和 fixture
     secrets/
 ```
 
-每台 VPS/EC2 使用一个独立的 `<site-id>`。`site.env` 保存该站点的真实配置，日志、备份、API 导出和生成计划都写入同一个站点目录。
+每台 VPS/EC2 使用一个独立的 `<site-id>`。`site.env` 保存该站点的真实配置。`chains/` 保存该站点的链路定义文件。日志、备份、API 导出和生成计划都写入同一个站点目录。
 
 ## 阅读顺序
 
@@ -65,6 +67,8 @@ tests/                  # 本地单元测试和 fixture
 8. [docs/design/workspace-layout-and-tech-stack.md](docs/design/workspace-layout-and-tech-stack.md)：目录设计和技术栈说明。
 9. [docs/design/api-automation-evaluation.md](docs/design/api-automation-evaluation.md)：S-UI API 自动化能力评估。
 10. [docs/design/automation-plan.md](docs/design/automation-plan.md)：自动化路线图。
+12. [docs/design/certificate-renewal-control-loop.md](docs/design/certificate-renewal-control-loop.md)：证书自动更新的控制闭环设计（含 Phase 6 详细实施计划）。
+13. [docs/design/chain-cli-extension-roadmap.md](docs/design/chain-cli-extension-roadmap.md)：链路级 CLI 扩展方案与延期重构 TODO。
 
 ## 快速开始
 
@@ -354,6 +358,101 @@ https://<DOMAIN>:2095/<WEB_PATH>/
 - `socks` 模式下，访问 IP 检测网站应显示住宅代理出口 IP。
 - `direct` 模式下，访问 IP 检测网站应显示 VPS/EC2 公网 IP。
 
+### 16. 链路级 CLI
+
+站点级 `apply` 负责初始化主拓扑。链路级 CLI 负责在已有站点内增量管理单条链路。
+
+当前定义：
+
+```text
+一条链路 = 一个用户 + 一个入站 + 一个出站策略 + 一条路由绑定
+```
+
+支持的出站策略：
+
+- `direct`：不创建额外出站，不写 route rule，最终走站点默认出口。
+- `shared`：复用一个已存在的出站，并为当前 inbound 增加 route rule。
+- `dedicated`：为当前链路创建专属出站，并为当前 inbound 增加 route rule。
+
+已实现命令：
+
+```bash
+bin/sui-deploy chain-import-current "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+bin/sui-deploy chain-list "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+bin/sui-deploy chain-show "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain-id>
+bin/sui-deploy chain-plan-create "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain.json>
+bin/sui-deploy chain-apply-create "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain.json>
+bin/sui-deploy chain-plan-delete "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain-id>
+bin/sui-deploy chain-apply-delete "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain-id>
+```
+
+链路文件位置：
+
+```text
+$SUI_WORKDIR/sites/$SITE_ID/chains/<chain-id>.json
+```
+
+最小链路示例：
+
+```json
+{
+  "chain_id": "alice-vless",
+  "name": "alice",
+  "client": {
+    "uuid": "",
+    "password": "",
+    "volume": 0,
+    "expiry": 0
+  },
+  "inbound": {
+    "type": "vless",
+    "tag": "vless-alice",
+    "listen_port": 11001,
+    "tls_tag": "reality",
+    "transport": {},
+    "addrs": []
+  },
+  "outbound": {
+    "mode": "shared",
+    "tag": "socks-residential"
+  }
+}
+```
+
+当前行为边界：
+
+- `chain-import-current` 会优先按 route rule 导入当前主链路；如果命中了 route rule，导入结果一律标记为 `shared`，不会自动推断 dedicated ownership。
+- `chain-plan-create` 和 `chain-apply-create` 会把以下情况视为致命前置错误并直接返回非零退出码：端口冲突、TLS 模板缺失、`shared` 引用的出站不存在。
+- `chain-apply-create` 只有在前置校验通过后才会执行备份和远端写入。
+- `chain-apply-delete` 只会在本地链路定义明确为 `dedicated`，且没有其他链路引用该出站时才删除出站。
+- 链路级 CLI 当前做的是结构验证，不自动验证真实出口 IP 和协议级连通性。
+
+## 16. 证书自动续签（Phase 6）
+
+站点初始化并获取证书后，可以使用证书自动续签功能。推荐采用双层闭环架构：
+
+- **内环**：VPS 本机 systemd timer 每 12 小时巡检，证书到期前自动续签（工作站离线也不影响）
+- **外环**：工作站定期运行 `cert-supervise` 监督各站点证书状态
+
+```bash
+# 1. 只读检查当前证书状态
+bin/sui-deploy cert-status "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+
+# 2. 手动触发一次续签（dry-run 预览操作）
+bin/sui-deploy cert-renew "$SUI_WORKDIR/sites/$SITE_ID/site.env" --dry-run
+bin/sui-deploy cert-renew "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+
+# 3. 在 VPS 安装自动 supervisor（一次性）
+bin/sui-deploy install-cert-supervisor "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+
+# 4. 状态机监督（区分 healthy / degraded / urgent / manual_intervention）
+bin/sui-deploy cert-supervise "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+```
+
+安装 supervisor 后，VPS 每 12 小时自动检查证书。剩余天数超过续签窗口（默认 1/3 寿命）时只观测不动作；进入窗口后自动备份旧证书 → acme.sh 续签 → install-cert → 重启 s-ui.service → 验证 TLS 指纹一致性。失败时退避重试，达到上限后进入 `manual_intervention` 等待人工处理。
+
+详细设计见 [docs/design/certificate-renewal-control-loop.md](docs/design/certificate-renewal-control-loop.md)。
+
 ## 命令参考
 
 ```bash
@@ -368,6 +467,17 @@ bin/sui-deploy backup "$SUI_WORKDIR/sites/$SITE_ID/site.env"
 bin/sui-deploy api-export "$SUI_WORKDIR/sites/$SITE_ID/site.env"
 bin/sui-deploy plan-apply "$SUI_WORKDIR/sites/$SITE_ID/site.env"
 bin/sui-deploy apply "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+bin/sui-deploy chain-import-current "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+bin/sui-deploy chain-list "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+bin/sui-deploy chain-show "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain-id>
+bin/sui-deploy chain-plan-create "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain.json>
+bin/sui-deploy chain-apply-create "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain.json>
+bin/sui-deploy chain-plan-delete "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain-id>
+bin/sui-deploy chain-apply-delete "$SUI_WORKDIR/sites/$SITE_ID/site.env" <chain-id>
+bin/sui-deploy cert-status "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+bin/sui-deploy cert-renew "$SUI_WORKDIR/sites/$SITE_ID/site.env" [--dry-run] [--force]
+bin/sui-deploy cert-supervise "$SUI_WORKDIR/sites/$SITE_ID/site.env"
+bin/sui-deploy install-cert-supervisor "$SUI_WORKDIR/sites/$SITE_ID/site.env"
 ```
 
 命令安全边界：
@@ -375,8 +485,14 @@ bin/sui-deploy apply "$SUI_WORKDIR/sites/$SITE_ID/site.env"
 - `check` 只做本地配置校验。
 - `diagnose` 只读 SSH 检查。
 - `plan-apply` 只生成计划，不修改远端。
+- `chain-plan-create`、`chain-plan-delete` 只生成链路计划，不修改远端。
 - `bootstrap`、`configure-panel`、`issue-cert`、`configure-https`、`create-api-token`、`apply` 会修改远端。
+- `chain-apply-create`、`chain-apply-delete` 会修改远端，并在写入前自动备份。
 - `apply` 会先备份，再调用 S-UI API。
+- `cert-status` 只读 SSH 检查远端证书状态，不修改远端。
+- `cert-renew` 会修改远端（续签、重启），并在续签前自动备份旧证书。
+- `cert-supervise` 只读检查，不修改远端。
+- `install-cert-supervisor` 会修改远端（上传文件、安装 timer、启动服务）。
 
 ## 技术栈
 
