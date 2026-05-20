@@ -67,8 +67,10 @@ tests/                  # 本地单元测试和 fixture
 8. [docs/design/workspace-layout-and-tech-stack.md](docs/design/workspace-layout-and-tech-stack.md)：目录设计和技术栈说明。
 9. [docs/design/api-automation-evaluation.md](docs/design/api-automation-evaluation.md)：S-UI API 自动化能力评估。
 10. [docs/design/automation-plan.md](docs/design/automation-plan.md)：自动化路线图。
-12. [docs/design/certificate-renewal-control-loop.md](docs/design/certificate-renewal-control-loop.md)：证书自动更新的控制闭环设计（含 Phase 6 详细实施计划）。
-13. [docs/design/chain-cli-extension-roadmap.md](docs/design/chain-cli-extension-roadmap.md)：链路级 CLI 扩展方案与延期重构 TODO。
+11. [CHANGELOG.md](CHANGELOG.md)：版本变更记录。
+12. [docs/releases/v0.1.0.md](docs/releases/v0.1.0.md)：`v0.1.0` 发布说明。
+13. [docs/design/certificate-renewal-control-loop.md](docs/design/certificate-renewal-control-loop.md)：证书自动更新的控制闭环设计（含 Phase 6 详细实施计划）。
+14. [docs/design/chain-cli-extension-roadmap.md](docs/design/chain-cli-extension-roadmap.md)：链路级 CLI 扩展方案与延期重构 TODO。
 
 ## 快速开始
 
